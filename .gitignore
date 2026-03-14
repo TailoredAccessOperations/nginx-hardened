@@ -1,0 +1,75 @@
+# Secrets and sensitive files
+*.key
+*.crt
+*.pem
+*.p12
+*.pfx
+*.jks
+/certs/
+/secrets/
+/keys/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+.env.production.local
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+/build/
+/dist/
+/out/
+
+# Docker
+docker-bake.json
+.dockerignore.local
+
+# Logs
+*.log
+logs/
+/var/log/
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+.vim/
+
+# Backup files
+*.backup
+*.bak
+*.old
+*~
+
+# Test artifacts
+/test-results/
+/coverage/
+.pytest_cache/
+
+# Cache
+.cache/
+node_modules/
+vendor/
+
+# OS-specific
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+
+# Private data
+private/
+sensitive/

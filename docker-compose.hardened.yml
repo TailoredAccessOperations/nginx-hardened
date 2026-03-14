@@ -1,0 +1,127 @@
+name: nginx-app-hardened
+
+services:
+  nginx:
+    build:
+      context: .
+      dockerfile: Dockerfile.hardened
+      args:
+        NGINX_VERSION: "1.26.0"
+      # Enable BuildKit cache mount for faster rebuilds
+      cache_from:
+        - type=local,src=/tmp/buildx-cache
+    image: nginx:hardened-1.26.0
+    container_name: nginx-web
+    restart: unless-stopped
+    stop_grace_period: 10s
+    stop_signal: SIGTERM
+
+    # Port mappings (80/443)
+    ports:
+      - "127.0.0.1:8080:80"   # Bind to localhost only (adjust as needed)
+      - "0.0.0.0:443:443"     # HTTPS available on all interfaces
+
+    # Volume mounts: read-only configs, tmpfs for runtime needs
+    volumes:
+      # Configuration (read-only from host)
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./conf.d:/etc/nginx/conf.d:ro
+      - ./html:/usr/share/nginx/html:ro
+
+      # Temporary runtime filesystems (noexec, nosuid for security)
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          size: 64m
+          mode: "1777"
+          options:
+            - noexec
+            - nosuid
+            - nodev
+
+      - type: tmpfs
+        target: /var/cache/nginx
+        tmpfs:
+          size: 256m
+          mode: "0755"
+
+      - type: tmpfs
+        target: /var/log/nginx
+        tmpfs:
+          size: 128m
+          mode: "0755"
+
+      - type: tmpfs
+        target: /run
+        tmpfs:
+          size: 10m
+          mode: "0755"
+          options:
+            - noexec
+
+    # Environment
+    environment:
+      TZ: UTC
+      NGINX_VERSION: "1.26.0"
+
+    # Networking
+    networks:
+      - frontend
+
+    # Health check: uses simple HTTP response (no external binary needed)
+    healthcheck:
+      test:
+        - CMD
+        - /usr/sbin/nginx
+        - "-t"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+    # Security: drop all capabilities, enable no_new_privileges
+    security_opt:
+      - no-new-privileges:true
+
+    # Drop ALL capabilities (distroless runs as non-root, so NET_BIND_SERVICE not needed)
+    cap_drop:
+      - ALL
+
+    # Explicitly do NOT add any capabilities back
+    # If you need 1024 port binding or similar, consider using iptables/docker port mapping instead
+
+    # File descriptor and process limits
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      nproc:
+        soft: 32768
+        hard: 32768
+
+    # Resource limits (CPU and memory)
+    deploy:
+      limits:
+        cpus: '2'
+        memory: 512M
+      reservations:
+        cpus: '1'
+        memory: 256M
+
+    # Logging: JSON format with rotation
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+        labels: "service=nginx,env=production"
+
+    # Read-only root filesystem (except tmpfs mounts above)
+    read_only: true
+
+networks:
+  frontend:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-nginx-prod
+      com.docker.network.bridge.enable_icc: "false"  # Disable inter-container communication by default
