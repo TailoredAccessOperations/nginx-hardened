@@ -33,10 +33,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: dev
+          - target: nginx-dev
             platforms: linux/amd64
             push: false
-          - target: ci
+          - target: nginx-ci
             platforms: linux/amd64,linux/arm64
             push: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
 
