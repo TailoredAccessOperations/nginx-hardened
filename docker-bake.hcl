@@ -38,8 +38,9 @@ target "common" {
 target "nginx" {
   inherits = ["common"]
   tags = [
-    "${REGISTRY}/${IMAGE_NAME}:latest",
-    "${REGISTRY}/${IMAGE_NAME}:${NGINX_VERSION}"
+    "ghcr.io/tailoredaccessoperations/nginx-hardened:latest",
+    "ghcr.io/tailoredaccessoperations/nginx-hardened:1.26.0",
+    "ghcr.io/tailoredaccessoperations/nginx-hardened:${NGINX_VERSION}"
   ]
   args = {
     NGINX_VERSION = NGINX_VERSION
@@ -51,7 +52,6 @@ target "nginx" {
 target "nginx-dev" {
   inherits = ["nginx"]
   output   = ["type=docker"]
-  tags     = ["${IMAGE_NAME}:dev"]
 }
 
 target "nginx-ci" {

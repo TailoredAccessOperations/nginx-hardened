@@ -82,9 +82,6 @@ jobs:
           targets: ${{ matrix.target }}
           push: ${{ matrix.push }}
           provenance: mode=max
-          set: |
-           *.tags=${{ steps.meta.outputs.tags }}
-            *.labels=${{ steps.meta.outputs.labels }}
 
       - name: Generate SBOM
         if: matrix.push
