@@ -1,65 +1,302 @@
-name: Build and Push Docker Image
+name: Docker Build and Test
 
 on:
   push:
-    branches:
-      - main
-      - develop
+    branches: [ main, develop, 'feature/**' ]
     tags:
       - 'v*'
-    paths:
-      - 'Dockerfile'
-      - 'docker-bake.hcl'
-      - 'nginx.conf'
-      - 'conf.d/**'
-      - '.github/workflows/docker-build.yml'
   pull_request:
-    branches:
-      - main
+    branches: [ main ]
+  schedule:
+    # Run security scans daily at 2 AM UTC
+    - cron: '0 2 * * *'
   workflow_dispatch:
 
-permissions:
-  contents: read
-  packages: write
-  id-token: write
+env:
+  NGINX_VERSION: 1.26.0
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 concurrency:
-  group: docker-build-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
+  # =============================================================================
+  # Job 1: Lint and Validate
+  # =============================================================================
+  lint:
+    name: Lint and Validate
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: ./Dockerfile
+          verbose: true
+          failure-threshold: error
+
+      - name: Lint Dockerfile.hardened
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: ./Dockerfile.hardened
+          verbose: true
+          failure-threshold: error
+
+      - name: Validate docker-compose files
+        run: |
+          docker compose -f docker-compose.yml config > /dev/null
+          docker compose -f docker-compose.production.yml config > /dev/null
+          docker compose -f docker-compose.hardened.yml config > /dev/null
+          echo "✓ All docker-compose files are valid"
+
+      - name: Check for secrets
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main
+          head: HEAD
+          extra_args: --debug --only-verified
+
+  # =============================================================================
+  # Job 2: Build and Test
+  # =============================================================================
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    needs: lint
     strategy:
+      fail-fast: false
       matrix:
+        dockerfile:
+          - Dockerfile
+          - Dockerfile.hardened
+          - Dockerfile.production
         include:
-          - target: nginx-dev
-            platforms: linux/amd64
-            push: false
-          - target: nginx-ci
-            platforms: linux/amd64,linux/arm64
-            push: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+          - dockerfile: Dockerfile
+            tag: standard
+          - dockerfile: Dockerfile.hardened
+            tag: hardened
+          - dockerfile: Dockerfile.production
+            tag: production
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
         with:
-          fetch-depth: 0
+          driver-opts: image=moby/buildkit:master
+
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./${{ matrix.dockerfile }}
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ matrix.tag }}-test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NGINX_VERSION=${{ env.NGINX_VERSION }}
+
+      - name: Test nginx configuration
+        run: |
+          docker run --rm ${{ env.IMAGE_NAME }}:${{ matrix.tag }}-test nginx -t
+
+      - name: Test container startup
+        run: |
+          docker run -d --name nginx-test -p 8080:80 ${{ env.IMAGE_NAME }}:${{ matrix.tag }}-test
+          sleep 5
+          curl -sf http://localhost:8080/healthz || (docker logs nginx-test && exit 1)
+          docker stop nginx-test && docker rm nginx-test
+
+      - name: Run smoke tests
+        run: |
+          docker run -d --name nginx-smoke -p 8080:80 ${{ env.IMAGE_NAME }}:${{ matrix.tag }}-test
+          sleep 3
+          
+          # Test health endpoint
+          curl -sf http://localhost:8080/healthz > /dev/null && echo "✓ Health check passed"
+          
+          # Test readiness endpoint
+          curl -sf http://localhost:8080/readyz > /dev/null && echo "✓ Readiness check passed"
+          
+          # Test main page
+          curl -sf http://localhost:8080/ > /dev/null && echo "✓ Main page accessible"
+          
+          # Test security headers
+          curl -sI http://localhost:8080/ | grep -q "X-Frame-Options" && echo "✓ Security headers present"
+          
+          docker stop nginx-smoke && docker rm nginx-smoke
+
+      - name: Check image size
+        run: |
+          SIZE=$(docker images ${{ env.IMAGE_NAME }}:${{ matrix.tag }}-test --format "{{.Size}}")
+          echo "Image size: $SIZE"
+          
+          # Parse size and check threshold
+          SIZE_VAL=$(echo "$SIZE" | sed 's/MB//' | sed 's/GB/*1024/' | sed 's/kB\/1024/')
+          if (( $(echo "$SIZE_VAL > 500" | bc -l 2>/dev/null || echo 0) )); then
+            echo "::warning::Image size ($SIZE) exceeds 500MB threshold"
+          fi
+
+      - name: Save test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.tag }}
+          path: |
+            *.log
+            test-results/
+
+  # =============================================================================
+  # Job 3: Security Scan
+  # =============================================================================
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner (filesystem)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+
+      - name: Run Trivy vulnerability scanner (config)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-config-results.sarif'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-fs-results.sarif'
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: dockerfile
+          output_format: sarif
+          output_file_path: reports/checkov.sarif
+
+  # =============================================================================
+  # Job 4: Performance Benchmark
+  # =============================================================================
+  benchmark:
+    name: Performance Benchmark
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build production image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.production
+          load: true
+          tags: nginx:benchmark
+          cache-from: type=gha
+
+      - name: Install wrk
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wrk
+
+      - name: Start nginx for benchmark
+        run: |
+          docker run -d --name nginx-bench \
+            -p 8080:80 \
+            --security-opt no-new-privileges:true \
+            --cap-drop ALL \
+            nginx:benchmark
+          sleep 5
+
+      - name: Run benchmark
+        run: |
+          echo "Running 60-second benchmark with 4 threads and 400 connections..."
+          wrk -t4 -c400 -d60s --latency http://localhost:8080/ > benchmark-results.txt
+          cat benchmark-results.txt
+          
+          # Extract and report metrics
+          REQUESTS=$(grep "Requests/sec" benchmark-results.txt | awk '{print $2}')
+          LATENCY_AVG=$(grep "Latency" benchmark-results.txt | head -1 | awk '{print $2}')
+          
+          echo "REQUESTS_PER_SEC=$REQUESTS" >> $GITHUB_ENV
+          echo "LATENCY_AVG=$LATENCY_AVG" >> $GITHUB_ENV
+          
+          # Comment on PR if this is a pull request
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "Performance benchmark completed:"
+            echo "- Requests/sec: $REQUESTS"
+            echo "- Average Latency: $LATENCY_AVG"
+          fi
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results.txt
+
+      - name: Cleanup
+        run: docker stop nginx-bench && docker rm nginx-bench
+
+  # =============================================================================
+  # Job 5: Build and Push Multi-Platform
+  # =============================================================================
+  push:
+    name: Build and Push Multi-Platform
+    runs-on: ubuntu-latest
+    needs: [lint, build-and-test, security-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      matrix:
+        include:
+          - dockerfile: Dockerfile
+            suffix: standard
+          - dockerfile: Dockerfile.hardened
+            suffix: hardened
+          - dockerfile: Dockerfile.production
+            suffix: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-        with:
-          version: latest
-          buildkitd-flags: --debug
 
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -67,102 +304,109 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: |
-            ghcr.io/${{ github.repository }}/nginx
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ matrix.suffix }}-latest
+            type=raw,value=${{ matrix.suffix }}-${{ env.NGINX_VERSION }}
 
       - name: Build and push
-        uses: docker/bake-action@v5
-        with:
-          targets: ${{ matrix.target }}
-          push: ${{ matrix.push }}
-          provenance: mode=max
-
-      - name: Generate SBOM
-        if: matrix.push
-        uses: anchore/sbom-action@v0
-        with:
-          image: ${{ steps.meta.outputs.tags && fromJson(steps.meta.outputs.tags)[0] || 'nginx:dev' }}
-          format: cyclonedx-json
-          output-file: sbom-${{ matrix.target }}.json
-
-      - name: Upload SBOM
-        if: matrix.push
-        uses: actions/upload-artifact@v4
-        with:
-          name: sbom-${{ matrix.target }}
-          path: sbom-*.json
-          retention-days: 30
-
-      - name: Scan image with Trivy
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ steps.meta.outputs.tags && fromJson(steps.meta.outputs.tags)[0] || 'nginx:dev' }}
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-        continue-on-error: true
-
-      - name: Upload Trivy results
-        uses: github/codeql-action/upload-sarif@v2
-        with:
-          sarif_file: 'trivy-results.sarif'
-        continue-on-error: true
-
-      - name: Install Cosign
-        if: matrix.push
-        uses: sigstore/cosign-installer@v3
-
-      - name: Sign image with Cosign
-        if: matrix.push
-        run: |
-          IMAGE_TAG=$(echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' | head -1)
-          echo "${{ secrets.COSIGN_KEY }}" > cosign.key
-          cosign sign --key cosign.key --yes "$IMAGE_TAG"
-        env:
-          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
-
-      - name: Verify Cosign signature
-        run: |
-          IMAGE_TAG=$(echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' | head -1)
-          cosign verify --key "${{ vars.COSIGN_PUBLIC_KEY }}" "$IMAGE_TAG" || true
-
-  test:
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.event_name == 'pull_request'
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build test image
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: false
-          load: true
-          tags: nginx:test
+          file: ./${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
 
-      - name: Test container
-        run: |
-          docker run --rm -d -p 8080:80 --name test-nginx nginx:test
-          sleep 3
-          curl -f http://localhost:8080/ || exit 1
-          docker stop test-nginx
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.suffix }}-latest
+          format: spdx-json
+          output-file: sbom-${{ matrix.suffix }}.spdx.json
 
-      - name: Check nginx configuration
-        run: |
-          docker run --rm nginx:test nginx -t
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.suffix }}
+          path: sbom-${{ matrix.suffix }}.spdx.json
 
-      - name: Inspect image
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image with Cosign
+        env:
+          COSIGN_EXPERIMENTAL: 1
         run: |
-          docker run --rm nginx:test sh -c 'nginx -v && echo "Modules:"; nginx -V 2>&1 | grep modules' || true
+          cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.suffix }}-latest@${{ steps.build.outputs.digest }}
+
+  # =============================================================================
+  # Job 6: Update Documentation
+  # =============================================================================
+  update-docs:
+    name: Update Documentation
+    runs-on: ubuntu-latest
+    needs: [push, benchmark]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download benchmark results
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-results
+
+      - name: Update README with metrics
+        run: |
+          REQUESTS="${{ env.REQUESTS_PER_SEC }}"
+          LATENCY="${{ env.LATENCY_AVG }}"
+          
+          if [ -f benchmark-results.txt ]; then
+            REQUESTS=$(grep "Requests/sec" benchmark-results.txt | awk '{print $2}')
+            LATENCY=$(grep "Latency" benchmark-results.txt | head -1 | awk '{print $2}')
+          fi
+          
+          # Update performance section
+          cat > .performance-metrics.md << EOF
+          ## Latest Performance Metrics
+          
+          | Metric | Value |
+          |--------|-------|
+          | Requests/sec | $REQUESTS |
+          | Average Latency | $LATENCY |
+          | Test Date | $(date -u +"%Y-%m-%d %H:%M:%S UTC") |
+          
+          *Benchmark run on GitHub Actions runner*
+          EOF
+          
+          # Replace performance section in README
+          if grep -q "<!-- PERFORMANCE_START -->" README.md; then
+            sed -i '/<!-- PERFORMANCE_START -->/,/<!-- PERFORMANCE_END -->/c\
+          <!-- PERFORMANCE_START -->\
+          '". $(cat .performance-metrics.md)"'\
+          <!-- PERFORMANCE_END -->' README.md
+          else
+            echo "" >> README.md
+            echo "<!-- PERFORMANCE_START -->" >> README.md
+            cat .performance-metrics.md >> README.md
+            echo "<!-- PERFORMANCE_END -->" >> README.md
+          fi
+
+      - name: Commit changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add README.md
+          git diff --staged --quiet || git commit -m "docs: Update performance metrics [skip ci]"
+          git push
