@@ -1,0 +1,272 @@
+name: Optimized Build and Test
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  NGINX_VERSION: 1.26.0
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # =============================================================================
+  # Stage 1: Security Scanning
+  # =============================================================================
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+      
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: ./Dockerfile
+          verbose: true
+          failure-threshold: warning
+
+  # =============================================================================
+  # Stage 2: Build Test
+  # =============================================================================
+  build-test:
+    runs-on: ubuntu-latest
+    needs: security-scan
+    strategy:
+      matrix:
+        dockerfile: [Dockerfile, Dockerfile.hardened, Dockerfile.production, Dockerfile.optimized]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=moby/buildkit:master
+      
+      - name: Build test image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./${{ matrix.dockerfile }}
+          push: false
+          load: true
+          tags: nginx:test-${{ matrix.dockerfile }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Test nginx configuration
+        run: |
+          docker run --rm nginx:test-${{ matrix.dockerfile }} nginx -t
+      
+      - name: Test container startup
+        run: |
+          docker run -d --name test-nginx -p 8080:80 nginx:test-${{ matrix.dockerfile }}
+          sleep 5
+          curl -sf http://localhost:8080/healthz || (docker logs test-nginx && exit 1)
+          docker stop test-nginx && docker rm test-nginx
+
+  # =============================================================================
+  # Stage 3: Performance Test
+  # =============================================================================
+  performance-test:
+    runs-on: ubuntu-latest
+    needs: build-test
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Build optimized image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.optimized
+          push: false
+          load: true
+          tags: nginx:optimized
+          cache-from: type=gha
+      
+      - name: Start nginx container
+        run: |
+          docker run -d --name nginx-perf \
+            -p 8080:80 \
+            --security-opt no-new-privileges:true \
+            --cap-drop ALL \
+            nginx:optimized
+          sleep 5
+      
+      - name: Install wrk
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wrk
+      
+      - name: Run performance benchmark
+        run: |
+          echo "Running 30-second benchmark..."
+          wrk -t4 -c400 -d30s --latency http://localhost:8080/ > benchmark-results.txt
+          cat benchmark-results.txt
+          
+          # Extract metrics
+          REQUESTS=$(grep "Requests/sec" benchmark-results.txt | awk '{print $2}')
+          LATENCY_AVG=$(grep "Latency" benchmark-results.txt | awk '{print $2}')
+          
+          echo "requests_per_sec=$REQUESTS" >> $GITHUB_ENV
+          echo "latency_avg=$LATENCY_AVG" >> $GITHUB_ENV
+      
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results.txt
+      
+      - name: Cleanup
+        run: docker stop nginx-perf && docker rm nginx-perf
+
+  # =============================================================================
+  # Stage 4: Multi-Architecture Build and Push
+  # =============================================================================
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: [security-scan, build-test, performance-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - dockerfile: Dockerfile
+            suffix: standard
+          - dockerfile: Dockerfile.hardened
+            suffix: hardened
+          - dockerfile: Dockerfile.optimized
+            suffix: optimized
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=,suffix=,format=short
+            type=raw,value=${{ matrix.suffix }}-latest
+            type=raw,value=${{ matrix.suffix }}-${{ env.NGINX_VERSION }}
+      
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NGINX_VERSION=${{ env.NGINX_VERSION }}
+      
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.suffix }}-latest
+          format: spdx-json
+          output-file: sbom-${{ matrix.suffix }}.spdx.json
+      
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.suffix }}
+          path: sbom-${{ matrix.suffix }}.spdx.json
+
+  # =============================================================================
+  # Stage 5: Security Scan Images
+  # =============================================================================
+  scan-images:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Scan optimized image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:optimized-latest
+          format: 'sarif'
+          output: 'trivy-image-results.sarif'
+      
+      - name: Upload image scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-image-results.sarif'
+
+  # =============================================================================
+  # Stage 6: Update Documentation
+  # =============================================================================
+  update-docs:
+    runs-on: ubuntu-latest
+    needs: [build-and-push, performance-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download benchmark results
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-results
+      
+      - name: Update README with performance metrics
+        run: |
+          REQUESTS=${{ env.requests_per_sec }}
+          LATENCY=${{ env.latency_avg }}
+          
+          # Update performance section in README
+          sed -i "/<!-- PERFORMANCE_START -->/,/<!-- PERFORMANCE_END -->/c\
+          <!-- PERFORMANCE_START -->\n\
+          ### Latest Performance Metrics\n\
+          - Requests/sec: $REQUESTS\n\
+          - Average Latency: $LATENCY\n\
+          *Tested on GitHub Actions runner*\n\
+          <!-- PERFORMANCE_END -->" README.md
+      
+      - name: Commit changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add README.md
+          git diff --staged --quiet || git commit -m "docs: Update performance metrics [skip ci]"
+          git push

@@ -63,12 +63,13 @@ services:
         hard: 32768
 
     deploy:
-      limits:
-        cpus: '2'
-        memory: 512M
-      reservations:
-        cpus: '1'
-        memory: 256M
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+        reservations:
+          cpus: '1'
+          memory: 256M
 
     logging:
       driver: "json-file"

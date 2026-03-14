@@ -1,0 +1,458 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+# FULLY OPTIMIZED NGINX BUILD
+# Multi-stage, security-hardened, performance-tuned
+# =============================================================================
+
+# ============================================================================
+# BUILDER STAGE 1: Base dependencies
+# ============================================================================
+FROM debian:bookworm-slim AS base-builder
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=UTC \
+    NGINX_VERSION=1.26.0 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+# Consolidated security-hardened compilation flags
+ENV CFLAGS="-O3 -march=x86-64-v3 -mtune=generic -fPIE -fPIC -fstack-protector-strong -D_FORTIFY_SOURCE=3 -Wformat -Wformat-security -Werror=format-security -fno-strict-aliasing" \
+    CXXFLAGS="-O3 -march=x86-64-v3 -mtune=generic -fPIE -fPIC -fstack-protector-strong -D_FORTIFY_SOURCE=3 -Wformat -Wformat-security -Werror=format-security -fno-strict-aliasing" \
+    LDFLAGS="-pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack -Wl,-z,separate-code"
+
+WORKDIR /build
+
+# Single consolidated RUN for base dependencies
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    # Build essentials
+    build-essential \
+    ca-certificates \
+    curl \
+    wget \
+    git \
+    pkg-config \
+    # Nginx build deps
+    autoconf \
+    automake \
+    bison \
+    flex \
+    libexpat1-dev \
+    libgd-dev \
+    libgeoip-dev \
+    libpcre3-dev \
+    libperl-dev \
+    libpq-dev \
+    libssl-dev \
+    libtool \
+    libxml2-dev \
+    libxslt1.1-dev \
+    lua5.1-dev \
+    nasm \
+    perl \
+    unzip \
+    uuid-dev \
+    zlib1g-dev \
+    # Compression libraries for brotli
+    libbrotli-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ============================================================================
+# BUILDER STAGE 2: Module cloning
+# ============================================================================
+FROM base-builder AS module-builder
+
+# Clone all modules in parallel using cache mounts for git
+RUN --mount=type=cache,target=/build/.git-cache \
+    set -ex && \
+    mkdir -p /build/modules && cd /build/modules && \
+    \
+    # Clone ngx_brotli with deps
+    git clone --depth 1 https://github.com/google/ngx_brotli.git && \
+    cd ngx_brotli && git submodule update --init --recursive && cd .. && \
+    \
+    # Clone other modules in parallel
+    git clone --depth 1 https://github.com/aperezdc/ngx-fancyindex.git & \
+    git clone --depth 1 https://github.com/FRiCKLE/ngx_cache_purge.git & \
+    git clone --depth 1 https://github.com/simpl/ngx_devel_kit.git & \
+    git clone --depth 1 https://github.com/openresty/array-var-nginx-module.git & \
+    git clone --depth 1 https://github.com/openresty/echo-nginx-module.git & \
+    git clone --depth 1 https://github.com/openresty/headers-more-nginx-module.git & \
+    git clone --depth 1 https://github.com/openresty/set-misc-nginx-module.git & \
+    git clone --depth 1 https://github.com/openresty/xss-nginx-module.git & \
+    git clone --depth 1 https://github.com/vozlt/nginx-module-vts.git & \
+    wait
+
+# ============================================================================
+# BUILDER STAGE 3: Nginx compilation
+# ============================================================================
+FROM module-builder AS nginx-builder
+
+# Download and verify nginx with cache
+RUN --mount=type=cache,target=/build/.nginx-cache \
+    set -ex && \
+    cd /build/.nginx-cache && \
+    if [ ! -f "nginx-${NGINX_VERSION}.tar.gz" ]; then \
+        wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"; \
+    fi && \
+    cp "nginx-${NGINX_VERSION}.tar.gz" /build/ && \
+    cd /build && \
+    tar -xzf "nginx-${NGINX_VERSION}.tar.gz" && \
+    mv "nginx-${NGINX_VERSION}" src
+
+# Configure and compile with all optimizations
+RUN cd /build/src && \
+    ./configure \
+        --prefix=/etc/nginx \
+        --sbin-path=/usr/sbin/nginx \
+        --modules-path=/usr/lib/nginx/modules \
+        --conf-path=/etc/nginx/nginx.conf \
+        --error-log-path=/var/log/nginx/error.log \
+        --http-log-path=/var/log/nginx/access.log \
+        --pid-path=/var/run/nginx.pid \
+        --lock-path=/var/nginx.lock \
+        --http-client-body-temp-path=/var/cache/nginx/client_temp \
+        --http-proxy-temp-path=/var/cache/nginx/proxy_temp \
+        --http-fastcgi-temp-path=/var/cache/nginx/fastcgi_temp \
+        --http-uwsgi-temp-path=/var/cache/nginx/uwsgi_temp \
+        --http-scgi-temp-path=/var/cache/nginx/scgi_temp \
+        --user=nginx \
+        --group=nginx \
+        --with-compat \
+        --with-file-aio \
+        --with-threads \
+        --with-http_ssl_module \
+        --with-http_v2_module \
+        --with-http_v3_module \
+        --with-http_realip_module \
+        --with-http_addition_module \
+        --with-http_sub_module \
+        --with-http_dav_module \
+        --with-http_gunzip_module \
+        --with-http_gzip_static_module \
+        --with-http_auth_request_module \
+        --with-http_secure_link_module \
+        --with-http_stub_status_module \
+        --with-http_mp4_module \
+        --with-stream \
+        --with-stream_ssl_module \
+        --with-stream_realip_module \
+        --with-mail \
+        --with-mail_ssl_module \
+        --with-pcre-jit \
+        --add-module=/build/modules/ngx_brotli \
+        --add-module=/build/modules/ngx-fancyindex \
+        --add-module=/build/modules/ngx_devel_kit \
+        --add-module=/build/modules/array-var-nginx-module \
+        --add-module=/build/modules/echo-nginx-module \
+        --add-module=/build/modules/headers-more-nginx-module \
+        --add-module=/build/modules/set-misc-nginx-module \
+        --add-module=/build/modules/xss-nginx-module \
+        --add-module=/build/modules/ngx_cache_purge \
+        --add-module=/build/modules/nginx-module-vts && \
+    make -j$(nproc) && \
+    make install && \
+    strip --strip-all /usr/sbin/nginx
+
+# Verify compilation
+RUN /usr/sbin/nginx -v && /usr/sbin/nginx -V 2>&1 | head -20
+
+# ============================================================================
+# BUILDER STAGE 4: Configuration optimization
+# ============================================================================
+FROM nginx-builder AS config-builder
+
+# Create optimized nginx.conf
+RUN cat > /etc/nginx/nginx.conf << 'EOF'
+# Optimized nginx configuration
+worker_processes auto;
+worker_rlimit_nofile 1048576;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 65535;
+    use epoll;
+    multi_accept on;
+    accept_mutex off;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # Optimized log format
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" rt=$request_time '
+                    'uct=$upstream_connect_time uht=$upstream_header_time urt=$upstream_response_time';
+
+    access_log /var/log/nginx/access.log main buffer=32k flush=5s;
+
+    # Core optimizations
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 30;
+    keepalive_requests 10000;
+    types_hash_max_size 2048;
+    client_max_body_size 50M;
+    server_tokens off;
+    server_name_in_redirect off;
+
+    # Connection handling
+    reset_timedout_connection on;
+    client_body_timeout 12;
+    client_header_timeout 12;
+    send_timeout 10;
+
+    # File caching
+    open_file_cache max=100000 inactive=60s;
+    open_file_cache_valid 120s;
+    open_file_cache_min_uses 2;
+    open_file_cache_errors on;
+
+    # Gzip optimization
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 5;
+    gzip_min_length 256;
+    gzip_types
+        text/plain
+        text/css
+        text/xml
+        text/javascript
+        application/json
+        application/javascript
+        application/xml+rss
+        application/rss+xml
+        application/atom+xml
+        image/svg+xml
+        application/vnd.ms-fontobject
+        application/x-font-ttf
+        font/opentype
+        font/ttf
+        font/eot
+        font/otf;
+    gzip_disable "msie6";
+
+    # Brotli compression
+    brotli on;
+    brotli_comp_level 5;
+    brotli_min_length 256;
+    brotli_types
+        text/plain
+        text/css
+        text/xml
+        text/javascript
+        application/json
+        application/javascript
+        application/xml+rss
+        application/rss+xml
+        application/atom+xml
+        image/svg+xml
+        application/vnd.ms-fontobject
+        application/x-font-ttf
+        font/opentype
+        font/ttf
+        font/eot
+        font/otf;
+
+    # Rate limiting
+    limit_req_zone $binary_remote_addr zone=general:100m rate=100r/s;
+    limit_conn_zone $binary_remote_addr zone=addr:100m;
+
+    # Upstream keepalive
+    upstream_keepalive 100;
+    upstream_keepalive_requests 1000;
+    upstream_keepalive_timeout 60s;
+
+    # Buffers
+    client_body_buffer_size 256k;
+    client_header_buffer_size 4k;
+    large_client_header_buffers 8 16k;
+
+    # Proxy buffers
+    proxy_buffering on;
+    proxy_buffer_size 128k;
+    proxy_buffers 8 128k;
+    proxy_busy_buffers_size 256k;
+    proxy_temp_path /var/cache/nginx/proxy_temp;
+
+    # Include additional configs
+    include /etc/nginx/conf.d/*.conf;
+}
+
+# Stream module for TCP/UDP load balancing
+stream {
+    include /etc/nginx/stream.conf.d/*.conf;
+}
+EOF
+
+# Create optimized health check config
+RUN mkdir -p /etc/nginx/conf.d && \
+    cat > /etc/nginx/conf.d/health.conf << 'EOF'
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self';" always;
+    add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+
+    # Health check endpoints
+    location /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "OK\n";
+    }
+
+    location /readyz {
+        access_log off;
+        default_type text/plain;
+        return 200 "Ready\n";
+    }
+
+    location /metrics {
+        access_log off;
+        stub_status on;
+        allow 127.0.0.1;
+        allow ::1;
+        deny all;
+    }
+
+    # Main content with rate limiting
+    location / {
+        limit_req zone=general burst=200 nodelay;
+        limit_conn addr 100;
+        root /usr/share/nginx/html;
+        index index.html index.htm;
+        
+        # Static file caching
+        location ~* \.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2|ttf|eot)$ {
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+            add_header Vary "Accept-Encoding";
+            access_log off;
+        }
+    }
+
+    # Deny access to hidden files
+    location ~ /\. {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+
+    # Block common exploits
+    location ~* \.(bak|config|sql|fla|psd|ini|log|sh|inc|swp|dist)$ {
+        deny all;
+    }
+}
+EOF
+
+# Create static content
+RUN mkdir -p /usr/share/nginx/html && \
+    cat > /usr/share/nginx/html/index.html << 'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nginx Hardened</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+        }
+        .container {
+            text-align: center;
+            padding: 2rem;
+            background: rgba(255,255,255,0.1);
+            border-radius: 20px;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+        }
+        h1 { font-size: 3rem; margin-bottom: 1rem; }
+        p { font-size: 1.2rem; opacity: 0.9; }
+        .status { 
+            display: inline-block; 
+            padding: 0.5rem 1rem; 
+            background: rgba(255,255,255,0.2);
+            border-radius: 50px;
+            margin-top: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 Nginx Hardened</h1>
+        <p>Optimized, Secure, Production-Ready</p>
+        <div class="status">✓ Running</div>
+    </div>
+</body>
+</html>
+EOF
+
+# ============================================================================
+# FINAL RUNTIME STAGE: Minimal, hardened image
+# ============================================================================
+FROM gcr.io/distroless/cc-debian12:nonroot
+
+# Metadata
+LABEL maintainer="Security Team" \
+      version="${NGINX_VERSION}" \
+      description="Optimized hardened nginx" \
+      org.opencontainers.image.source="https://github.com/yourusername/nginx-hardened"
+
+# Copy compiled nginx binary
+COPY --from=nginx-builder --chown=nonroot:nonroot /usr/sbin/nginx /usr/sbin/nginx
+
+# Copy nginx configuration
+COPY --from=config-builder --chown=nonroot:nonroot /etc/nginx /etc/nginx
+
+# Copy CA certificates for HTTPS
+COPY --from=nginx-builder /etc/ssl/certs /etc/ssl/certs
+
+# Copy required libraries
+COPY --from=nginx-builder /lib/x86_64-linux-gnu/libpcre.so.3 /lib/x86_64-linux-gnu/
+COPY --from=nginx-builder /lib/x86_64-linux-gnu/libssl.so.3 /lib/x86_64-linux-gnu/
+COPY --from=nginx-builder /lib/x86_64-linux-gnu/libcrypto.so.3 /lib/x86_64-linux-gnu/
+COPY --from=nginx-builder /lib/x86_64-linux-gnu/libz.so.1 /lib/x86_64-linux-gnu/
+COPY --from=nginx-builder /lib/x86_64-linux-gnu/libcrypt.so.1 /lib/x86_64-linux-gnu/
+COPY --from=nginx-builder /usr/lib/x86_64-linux-gnu/libbrotlienc.so.1 /usr/lib/x86_64-linux-gnu/
+COPY --from=nginx-builder /usr/lib/x86_64-linux-gnu/libbrotlidec.so.1 /usr/lib/x86_64-linux-gnu/
+COPY --from=nginx-builder /usr/lib/x86_64-linux-gnu/libbrotlicommon.so.1 /usr/lib/x86_64-linux-gnu/
+
+# Create required directories
+WORKDIRvar/cache/nginx
+
+# Expose ports
+EXPOSE 80/tcp
+EXPOSE 443/tcp
+EXPOSE 443/udp
+
+# Run as non-root
+USER nonroot:nonroot
+
+# Health check
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["/usr/sbin/nginx", "-t"]
+
+# Start nginx
+ENTRYPOINT ["/usr/sbin/nginx"]
+CMD ["-g", "daemon off;"]

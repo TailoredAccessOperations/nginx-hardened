@@ -46,9 +46,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN mkdir -p /build/modules && cd /build/modules
 
 # 1. ngx_brotli - compression (maintained by Google, active development)
-RUN git clone https://github.com/google/ngx_brotli.git --depth 1 && \
-    cd ngx_brotli && git checkout 0f6aff84e12d31e4e4f0d88dcf1ef4aa92ed3c15 && \
-    git submodule update --init --recursive && cd ..
+RUN git clone --recurse-submodules https://github.com/google/ngx_brotli.git
 
 # 2. ngx-fancyindex - directory listing (low maintenance risk, stable)
 RUN git clone https://github.com/aperezdc/ngx-fancyindex.git --depth 1 && \
@@ -161,8 +159,6 @@ RUN cd /build/src && \
         --add-module=/build/modules/array-var-nginx-module \
         --add-module=/build/modules/echo-nginx-module \
         --add-module=/build/modules/headers-more-nginx-module \
-        --add-module=/build/modules/memc-nginx-module \
-        --add-module=/build/modules/redis2-nginx-module \
         --add-module=/build/modules/set-misc-nginx-module \
         --add-module=/build/modules/xss-nginx-module \
         --add-module=/build/modules/ngx_cache_purge \

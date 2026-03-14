@@ -1,0 +1,160 @@
+# syntax=docker/dockerfile:1.7
+# ============================================================================
+# PRODUCTION-HARDENED NGINX BUILD
+# Security-first multi-stage build with pinned dependencies
+# ============================================================================
+
+# ---- BUILDER STAGE: Compile nginx + modules with known-good commits ----
+FROM debian:bookworm-slim AS builder
+
+ARG NGINX_VERSION=1.26.0
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=UTC \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    NGINX_VERSION=${NGINX_VERSION}
+
+# Hardened compilation flags
+ENV CFLAGS="-O2 -fPIE -fPIC -fstack-protector-strong -D_FORTIFY_SOURCE=2" \
+    CXXFLAGS="-O2 -fPIE -fPIC -fstack-protector-strong -D_FORTIFY_SOURCE=2" \
+    LDFLAGS="-pie -Wl,-z,relro -Wl,-z,now"
+
+WORKDIR /build
+
+# Single layer: Install all build dependencies (optimized caching)
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl wget git build-essential pkg-config \
+    autoconf automake bison flex \
+    libexpat1-dev libgd-dev libgeoip-dev libpcre3-dev libperl-dev \
+    libssl-dev libtool libxml2-dev libxslt1-dev lua5.1 lua5.1-dev \
+    nasm perl unzip zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Single layer: Clone all nginx modules with pinned versions (reduces layers from 12 to 1)
+RUN mkdir -p /build/modules && cd /build/modules && \
+    # ngx_brotli - Brotli compression (with submodule)
+    git clone --depth 1 --branch v1.0.4 https://github.com/google/ngx_brotli.git && \
+    cd ngx_brotli && git submodule update --init --recursive && \
+    cd /build/modules && \
+    # ngx-fancyindex - Enhanced directory listing
+    git clone --depth 1 --branch v0.5.2 https://github.com/aperezdc/ngx-fancyindex.git && \
+    # ngx_cache_purge - Cache purge support
+    git clone --depth 1 --branch 2.5 https://github.com/FRiCKLE/ngx_cache_purge.git && \
+    # ngx_devel_kit - Development kit
+    git clone --depth 1 --branch v0.3.3 https://github.com/simpl/ngx_devel_kit.git && \
+    # array-var-nginx-module - Variable arrays
+    git clone --depth 1 --branch v0.07 https://github.com/openresty/array-var-nginx-module.git && \
+    # echo-nginx-module - Debug echoing
+    git clone --depth 1 --branch v0.83 https://github.com/openresty/echo-nginx-module.git && \
+    # headers-more-nginx-module - Header manipulation
+    git clone --depth 1 --branch v0.37 https://github.com/openresty/headers-more-nginx-module.git && \
+    # set-misc-nginx-module - Variable manipulation
+    git clone --depth 1 --branch v0.33 https://github.com/openresty/set-misc-nginx-module.git && \
+    # xss-nginx-module - XSS filtering
+    git clone --depth 1 --branch v0.06 https://github.com/openresty/xss-nginx-module.git && \
+    # nginx-module-vts - Virtual traffic status
+    git clone --depth 1 --branch v0.1.10 https://github.com/vozlt/nginx-module-vts.git
+
+# Download nginx source
+RUN set -ex && \
+    wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" && \
+    tar -xzf "nginx-${NGINX_VERSION}.tar.gz" && \
+    rm "nginx-${NGINX_VERSION}.tar.gz"
+
+# Configure and compile nginx (single layer)
+RUN cd /build/nginx-${NGINX_VERSION} && \
+    ./configure \
+        --prefix=/etc/nginx \
+        --sbin-path=/usr/sbin/nginx \
+        --modules-path=/usr/lib64/nginx/modules \
+        --conf-path=/etc/nginx/nginx.conf \
+        --error-log-path=/var/log/nginx/error.log \
+        --http-log-path=/var/log/nginx/access.log \
+        --pid-path=/run/nginx.pid \
+        --lock-path=/run/nginx.lock \
+        --http-client-body-temp-path=/var/cache/nginx/client_temp \
+        --http-proxy-temp-path=/var/cache/nginx/proxy_temp \
+        --http-fastcgi-temp-path=/var/cache/nginx/fastcgi_temp \
+        --http-uwsgi-temp-path=/var/cache/nginx/uwsgi_temp \
+        --http-scgi-temp-path=/var/cache/nginx/scgi_temp \
+        --user=nginx \
+        --group=nginx \
+        --with-compat \
+        --with-file-aio \
+        --with-threads \
+        --with-http_ssl_module \
+        --with-http_v2_module \
+        --with-http_realip_module \
+        --with-http_addition_module \
+        --with-http_sub_module \
+        --with-http_dav_module \
+        --with-http_gunzip_module \
+        --with-http_gzip_static_module \
+        --with-http_auth_request_module \
+        --with-http_secure_link_module \
+        --with-http_stub_status_module \
+        --with-stream \
+        --with-stream_ssl_module \
+        --with-stream_realip_module \
+        --with-mail \
+        --with-mail_ssl_module \
+        --with-pcre-jit \
+        --add-module=/build/modules/ngx_brotli \
+        --add-module=/build/modules/ngx-fancyindex \
+        --add-module=/build/modules/ngx_devel_kit \
+        --add-module=/build/modules/array-var-nginx-module \
+        --add-module=/build/modules/echo-nginx-module \
+        --add-module=/build/modules/headers-more-nginx-module \
+        --add-module=/build/modules/set-misc-nginx-module \
+        --add-module=/build/modules/xss-nginx-module \
+        --add-module=/build/modules/ngx_cache_purge \
+        --add-module=/build/modules/nginx-module-vts && \
+    make -j"$(nproc)" && \
+    make install && \
+    strip -s /usr/sbin/nginx
+
+# Verify compilation
+RUN /usr/sbin/nginx -v
+
+# ---- RUNTIME STAGE: Minimal, hardened, non-root image ----
+FROM gcr.io/distroless/base-debian12:nonroot
+
+# Metadata
+LABEL org.opencontainers.image.title="Hardened Nginx" \
+      org.opencontainers.image.description="Production-hardened Nginx with security modules" \
+      org.opencontainers.image.version="${NGINX_VERSION}" \
+      org.opencontainers.image.vendor="Security Team" \
+      org.opencontainers.image.licenses="BSD-2-Clause" \
+      maintainer="Security Team"
+
+# Copy compiled artifacts from builder (fewer layers via multi-copy)
+COPY --from=builder /usr/sbin/nginx /usr/sbin/nginx
+COPY --from=builder /etc/nginx /etc/nginx
+COPY --from=builder /usr/lib64/nginx/modules /usr/lib64/nginx/modules
+COPY --from=builder /etc/ssl/certs /etc/ssl/certs
+COPY --from=builder /etc/ssl/openssl.cnf /etc/ssl/openssl.cnf
+
+# Create required directories
+RUN mkdir -p /var/cache/nginx/{client_temp,proxy_temp,fastcgi_temp,uwsgi_temp,scgi_temp} \
+             /var/log/nginx /run && \
+    chown -R 65534:65534 /var/cache/nginx /var/log/nginx
+
+# Copy application configuration
+COPY --chown=65534:65534 nginx.conf /etc/nginx/nginx.conf
+COPY --chown=65534:65534 conf.d/ /etc/nginx/conf.d/
+COPY --chown=65534:65534 html/ /usr/share/nginx/html/
+
+# Health check (distroless wget)
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD wget --spider -q http://127.0.0.1/healthz || exit 1
+
+EXPOSE 80 443
+
+# Run as nonroot (distroless nonroot user = UID 65534)
+USER 65534:65534
+
+ENTRYPOINT ["/usr/sbin/nginx"]
+CMD ["-g", "daemon off;"]

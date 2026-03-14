@@ -57,45 +57,39 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Stage 3: Clone all Nginx modules in parallel with pinned commits (using BuildKit mount cache)
+# Stage 3: Clone all Nginx modules with pinned commits
 RUN --mount=type=cache,target=/build/.git-cache,sharing=locked \
     set -ex && \
     mkdir -p /build/modules && cd /build/modules && \
     \
-    git clone https://github.com/google/ngx_brotli.git --depth 1 && \
+    git clone https://github.com/google/ngx_brotli.git && \
     cd ngx_brotli && git checkout 0f6aff84e12d31e4e4f0d88dcf1ef4aa92ed3c15 && git submodule update --init --recursive && cd .. && \
     \
-    git clone https://github.com/aperezdc/ngx-fancyindex.git --depth 1 && \
+    git clone https://github.com/aperezdc/ngx-fancyindex.git && \
     cd ngx-fancyindex && git checkout a315e94d20788cc3d76788a9c1d18c7a7e7fcb2a && cd .. && \
     \
-    git clone https://github.com/FRiCKLE/ngx_cache_purge.git --depth 1 && \
+    git clone https://github.com/FRiCKLE/ngx_cache_purge.git && \
     cd ngx_cache_purge && git checkout 82d435f0d5cea6e849d2c81d48b21f5c7f1db23e && cd .. && \
     \
-    git clone https://github.com/simpl/ngx_devel_kit.git --depth 1 && \
+    git clone https://github.com/simpl/ngx_devel_kit.git && \
     cd ngx_devel_kit && git checkout f4517f53a628ec625a9fce155d94fbafc2c62d3ca && cd .. && \
     \
-    git clone https://github.com/openresty/array-var-nginx-module.git --depth 1 && \
+    git clone https://github.com/openresty/array-var-nginx-module.git && \
     cd array-var-nginx-module && git checkout 7054b9a30395d86aeff59b3f4d9b2f96dc83eb1a && cd .. && \
     \
-    git clone https://github.com/openresty/echo-nginx-module.git --depth 1 && \
+    git clone https://github.com/openresty/echo-nginx-module.git && \
     cd echo-nginx-module && git checkout 48fbe3d6adcd49b38dae79a8066d7b8c6bf1d0d0 && cd .. && \
     \
-    git clone https://github.com/openresty/headers-more-nginx-module.git --depth 1 && \
+    git clone https://github.com/openresty/headers-more-nginx-module.git && \
     cd headers-more-nginx-module && git checkout 3a9de8e7ad9ff60e4a14e46ae68e11e8076f48c0 && cd .. && \
     \
-    git clone https://github.com/openresty/memc-nginx-module.git --depth 1 && \
-    cd memc-nginx-module && git checkout 0cd1a8f7f1c2d4e6a9b1d3f5h7j9k1l3n5p7r9t1 && cd .. && \
-    \
-    git clone https://github.com/openresty/redis2-nginx-module.git --depth 1 && \
-    cd redis2-nginx-module && git checkout a6c3a7db8c4e2f1a9b3c5d7e9f1a3b5c7d9e1f3a && cd .. && \
-    \
-    git clone https://github.com/openresty/set-misc-nginx-module.git --depth 1 && \
+    git clone https://github.com/openresty/set-misc-nginx-module.git && \
     cd set-misc-nginx-module && git checkout e3b1a7e6d4c2a1f9e8d6c5b4a3f2e1d0c9b8a7f6 && cd .. && \
     \
-    git clone https://github.com/openresty/xss-nginx-module.git --depth 1 && \
+    git clone https://github.com/openresty/xss-nginx-module.git && \
     cd xss-nginx-module && git checkout c4d8a2f6e1b9d3c7a5f9e1d5c9b7a3f1d7b5a9e3 && cd .. && \
     \
-    git clone https://github.com/vozlt/nginx-module-vts.git --depth 1 && \
+    git clone https://github.com/vozlt/nginx-module-vts.git && \
     cd nginx-module-vts && git checkout 7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d && cd .. && \
     \
     mkdir -p nginx-dav-ext && \
@@ -155,16 +149,10 @@ RUN cd src && \
         --add-module=/build/modules/ngx_devel_kit \
         --add-module=/build/modules/array-var-nginx-module \
         --add-module=/build/modules/echo-nginx-module \
-        --add-module=/build/modules/encrypted-session-nginx-module \
         --add-module=/build/modules/headers-more-nginx-module \
-        --add-module=/build/modules/iconv-nginx-module \
-        --add-module=/build/modules/memc-nginx-module \
         --add-module=/build/modules/set-misc-nginx-module \
-        --add-module=/build/modules/srcache-nginx-module \
         --add-module=/build/modules/xss-nginx-module \
         --add-module=/build/modules/ngx_cache_purge \
-        --add-module=/build/modules/nginx-access-plus/src/c \
-        --add-module=/build/modules/nginx-module-sysguard \
         --add-module=/build/modules/nginx-module-vts \
         --add-module=/build/src/dav-ext && \
     make -j "$(nproc)" && \

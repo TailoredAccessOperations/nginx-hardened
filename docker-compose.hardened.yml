@@ -33,31 +33,25 @@ services:
         target: /tmp
         tmpfs:
           size: 64m
-          mode: "1777"
-          options:
-            - noexec
-            - nosuid
-            - nodev
+          mode: 1777
 
       - type: tmpfs
         target: /var/cache/nginx
         tmpfs:
           size: 256m
-          mode: "0755"
+          mode: 493
 
       - type: tmpfs
         target: /var/log/nginx
         tmpfs:
           size: 128m
-          mode: "0755"
+          mode: 493
 
       - type: tmpfs
         target: /run
         tmpfs:
           size: 10m
-          mode: "0755"
-          options:
-            - noexec
+          mode: 493
 
     # Environment
     environment:
@@ -101,12 +95,13 @@ services:
 
     # Resource limits (CPU and memory)
     deploy:
-      limits:
-        cpus: '2'
-        memory: 512M
-      reservations:
-        cpus: '1'
-        memory: 256M
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+        reservations:
+          cpus: '1'
+          memory: 256M
 
     # Logging: JSON format with rotation
     logging:
