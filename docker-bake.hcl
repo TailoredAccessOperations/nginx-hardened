@@ -1,9 +1,9 @@
 variable "REGISTRY" {
-  default = "docker.io"
+  default = "ghcr.io"
 }
 
 variable "IMAGE_NAME" {
-  default = "nginx"
+  default = "nginx-hardened"
 }
 
 variable "NGINX_VERSION" {
@@ -23,14 +23,15 @@ group "ci" {
 }
 
 target "common" {
-  dockerfile = "Dockerfile"
+  dockerfile = "Dockerfile.hardened"
   context    = "."
   labels = {
-    "org.opencontainers.image.title"       = "Custom Nginx"
-    "org.opencontainers.image.description" = "Production-ready Nginx with extended modules"
+    "org.opencontainers.image.title"       = "Hardened Nginx"
+    "org.opencontainers.image.description" = "Production-hardened Nginx with security-first multi-stage build"
     "org.opencontainers.image.version"     = "${NGINX_VERSION}"
-    "org.opencontainers.image.url"         = "https://github.com/yourusername/nginx"
-    "org.opencontainers.image.vendor"      = "Your Organization"
+    "org.opencontainers.image.source"      = "https://github.com/TailoredAccessOperations/nginx-hardened"
+    "org.opencontainers.image.vendor"      = "Security Team"
+    "org.opencontainers.image.licenses"    = "BSD-2-Clause"
   }
 }
 
